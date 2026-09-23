@@ -1,49 +1,30 @@
 """
 llm_engine.py
 
-All calls to the LLM (Anthropic Claude) live here, plus the
-hallucination-mitigation logic:
-
-  1. RETRIEVAL-GROUNDED PROMPTS
-     We never ask the model to answer "from memory". Every prompt embeds
-     only the retrieved segments (with their transcript-file + timestamp
-     IDs) and instructs the model to answer *only* from them.
-
-  2. STRUCTURED OUTPUT
-     The model is asked to return JSON: {answer, quote, timestamp,
-     source_file}. Structured output is far easier to verify and render
-     than free text.
-
-  3. QUOTE VERIFICATION (the main hallucination guardrail)
-     After the model responds, `verify_quote()` checks that the returned
-     quote is an actual (near-exact) substring of the segment it cites.
-     If it isn't, we mark it "unverified" in the UI instead of silently
-     trusting the model. This is the single most important design
-     decision for the "how do you reduce hallucinations" question.
-
-  4. "NOT MENTIONED" ESCAPE HATCH
-     The model is explicitly told it's allowed — and expected — to say a
-     topic was not discussed, rather than inventing an answer.
+Gemini-powered LLM layer with retrieval grounding,
+structured JSON output, and quote verification.
 """
 
 from __future__ import annotations
-
 import json
 import os
 import re
+import time
+from dotenv import load_dotenv
+load_dotenv()
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import List, Optional
+from typing import List
 
 from transcript_parser import QASegment
 
 try:
-    import anthropic
+    from google import genai
 except ImportError:  # pragma: no cover
-    anthropic = None
+    genai = None
 
-MODEL_NAME = os.environ.get("HASAMEX_MODEL", "claude-sonnet-4-5")
 
+MODEL_NAME = os.environ.get("HASAMEX_MODEL", "gemini-3.6-flash")
 
 @dataclass
 class Citation:
@@ -61,26 +42,33 @@ class GroundedAnswer:
     not_mentioned: bool
 
 
-def _client() -> "anthropic.Anthropic":
-    if anthropic is None:
+def _client():
+    if genai is None:
         raise RuntimeError(
-            "The 'anthropic' package is not installed. Run: pip install anthropic"
+            "The 'google-genai' package is not installed. "
+            "Run: pip install -U google-genai"
         )
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+
     if not api_key:
         raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add your key."
+            "GEMINI_API_KEY is not set. Add your Gemini API key to .env."
         )
-    return anthropic.Anthropic(api_key=api_key)
+
+    return genai.Client(api_key=api_key)
 
 
 def _format_segments(segments: List[QASegment]) -> str:
     lines = []
+
     for s in segments:
         lines.append(
             f"[{s.source_file} | {s.expert} | {s.market} | {s.timestamp}]\n"
-            f"Q: {s.question}\nA: {s.answer}\n"
+            f"Q: {s.question}\n"
+            f"A: {s.answer}\n"
         )
+
     return "\n".join(lines)
 
 
@@ -88,134 +76,393 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
-def verify_quote(quote: str, segments: List[QASegment], min_ratio: float = 0.85) -> bool:
-    """Check the quote is a genuine (near-)substring of some source answer."""
+def verify_quote(
+    quote: str,
+    segments: List[QASegment],
+    min_ratio: float = 0.85
+) -> bool:
+    """Check that the quote is a genuine or near-exact substring."""
+
     nq = _normalize(quote)
+
     if not nq:
         return False
+
     for s in segments:
         na = _normalize(s.answer)
+
         if nq in na:
             return True
-        # fuzzy fallback for minor paraphrase of wording/punctuation
-        if SequenceMatcher(None, nq, na).find_longest_match(0, len(nq), 0, len(na)).size >= int(
-            len(nq) * min_ratio
-        ):
+
+        match = SequenceMatcher(
+            None,
+            nq,
+            na
+        ).find_longest_match(
+            0,
+            len(nq),
+            0,
+            len(na)
+        )
+
+        if match.size >= int(len(nq) * min_ratio):
             return True
+
     return False
 
 
 def _extract_json(raw: str) -> dict:
     raw = raw.strip()
-    raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE)
+
+    raw = re.sub(
+        r"^```json\s*|\s*```$",
+        "",
+        raw,
+        flags=re.MULTILINE
+    )
+
     return json.loads(raw)
 
 
-SYSTEM_PROMPT = """You are an analyst assistant answering questions ONLY from the \
-provided expert-call transcript excerpts. Rules:
+SYSTEM_PROMPT = """
+You are an analyst assistant answering questions ONLY from the
+provided expert-call transcript excerpts.
 
-1. Use ONLY the excerpts given to you. Never use outside knowledge.
-2. If the excerpts do not contain the answer, say so explicitly instead of guessing.
-3. Every factual claim must be backed by an exact quote copied verbatim from the \
-excerpts, plus its [source_file, timestamp, expert].
-4. Do not merge or paraphrase quotes into something that isn't literally present.
-5. Respond ONLY with valid JSON matching the schema you're given. No prose, no markdown fences."""
+Rules:
+
+1. Use ONLY the excerpts provided.
+2. Never use outside knowledge.
+3. If the excerpts do not contain the answer, say so explicitly.
+4. Every factual claim must be supported by an exact quote from the excerpts.
+5. Quotes must be copied verbatim from the excerpts.
+6. Do not invent quotes.
+7. Do not merge or paraphrase quotes.
+8. Include the source file and timestamp for every citation.
+9. Return ONLY valid JSON.
+10. Do not use markdown fences.
+"""
 
 
-def answer_question_for_expert(question: str, segments: List[QASegment]) -> GroundedAnswer:
-    """Answer one interview-guide question for a single expert, grounded + cited."""
-    schema = (
-        '{"not_mentioned": bool, "answer": string, '
-        '"citations": [{"quote": string, "timestamp": string, "source_file": string}]}'
-    )
-    prompt = (
-        f"EXCERPTS:\n{_format_segments(segments)}\n\n"
-        f"QUESTION: {question}\n\n"
-        f"Return JSON matching this schema exactly: {schema}\n"
-        f"If the question is not addressed in the excerpts, set not_mentioned=true, "
-        f"answer should explain that, and citations should be an empty list."
-    )
+def _generate(prompt: str, max_tokens: int = 2000) -> str:
     client = _client()
-    resp = client.messages.create(
-        model=MODEL_NAME,
-        max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = "".join(block.text for block in resp.content if block.type == "text")
+
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config={
+                    "system_instruction": SYSTEM_PROMPT,
+                    "temperature": 0,
+                    "max_output_tokens": max_tokens,
+                    "response_mime_type": "application/json",
+                },
+            )
+            return response.text
+
+        except Exception as e:
+            if "503" not in str(e) or attempt == 2:
+                raise
+
+            time.sleep(3 * (attempt + 1))
+
+def answer_question_for_expert(
+    question: str,
+    segments: List[QASegment]
+) -> GroundedAnswer:
+    """Answer one interview-guide question for one expert."""
+
+    schema = """
+{
+  "not_mentioned": true or false,
+  "answer": "string",
+  "citations": [
+    {
+      "quote": "exact quote",
+      "timestamp": "timestamp",
+      "source_file": "source file"
+    }
+  ]
+}
+"""
+
+    prompt = f"""
+EXPERT TRANSCRIPT EXCERPTS:
+
+{_format_segments(segments)}
+
+QUESTION:
+{question}
+
+Return JSON matching this schema exactly:
+
+{schema}
+
+If the question is not addressed in the excerpts:
+
+- set "not_mentioned" to true
+- explain that it was not mentioned
+- return an empty citations list
+
+Do not invent information or quotes.
+"""
+
+    raw = _generate(prompt, max_tokens=1000)
     data = _extract_json(raw)
 
     citations = []
+
     for c in data.get("citations", []):
-        verified = verify_quote(c.get("quote", ""), segments)
-        expert = next((s.expert for s in segments if s.source_file == c.get("source_file")), "")
+        quote = c.get("quote", "")
+        source_file = c.get("source_file", "")
+
+        verified = verify_quote(
+            quote,
+            segments
+        )
+
+        expert = next(
+            (
+                s.expert
+                for s in segments
+                if s.source_file == source_file
+            ),
+            ""
+        )
+
         citations.append(
             Citation(
-                source_file=c.get("source_file", ""),
+                source_file=source_file,
                 timestamp=c.get("timestamp", ""),
                 expert=expert,
-                quote=c.get("quote", ""),
+                quote=quote,
                 verified=verified,
             )
         )
+
     return GroundedAnswer(
         answer_text=data.get("answer", ""),
         citations=citations,
-        not_mentioned=bool(data.get("not_mentioned", False)),
+        not_mentioned=bool(
+            data.get("not_mentioned", False)
+        ),
     )
 
+def answer_all_questions_for_expert(
+    questions: List[str],
+    segments: List[QASegment]
+) -> List[GroundedAnswer]:
 
-def cross_transcript_themes(all_segments_by_expert: dict) -> dict:
+    schema = """
+{
+  "answers": [
+    {
+      "question_number": 1,
+      "not_mentioned": false,
+      "answer": "string",
+      "citations": [
+        {
+          "quote": "exact quote",
+          "timestamp": "timestamp",
+          "source_file": "source file"
+        }
+      ]
+    }
+  ]
+}
+"""
+
+    questions_text = "\n".join(
+        f"{i + 1}. {q}" for i, q in enumerate(questions)
+    )
+
+    prompt = f"""
+EXPERT TRANSCRIPT EXCERPTS:
+
+{_format_segments(segments)}
+
+INTERVIEW QUESTIONS:
+
+{questions_text}
+
+Answer ALL questions in ONE response.
+
+For each question:
+- Use ONLY the transcript excerpts.
+- Give an evidence-based answer.
+- Every factual claim must be supported by an exact quote.
+- Quotes must be copied verbatim.
+- Include the timestamp and source file.
+- If the transcript does not address the question, set
+  "not_mentioned" to true and use an empty citations list.
+- Keep question_number exactly aligned with the numbered questions.
+
+Return JSON matching this schema exactly:
+
+{schema}
+
+Do not invent information or quotes.
+"""
+
+    raw = _generate(prompt, max_tokens=3000)
+    data = _extract_json(raw)
+
+    returned = {
+        int(item.get("question_number", 0)): item
+        for item in data.get("answers", [])
+    }
+
+    results = []
+
+    for number, question in enumerate(questions, start=1):
+        item = returned.get(number, {})
+
+        citations = []
+
+        for c in item.get("citations", []):
+            quote = c.get("quote", "")
+            source_file = c.get("source_file", "")
+
+            verified = verify_quote(
+                quote,
+                segments
+            )
+
+            expert = next(
+                (
+                    s.expert
+                    for s in segments
+                    if s.source_file == source_file
+                ),
+                ""
+            )
+
+            citations.append(
+                Citation(
+                    source_file=source_file,
+                    timestamp=c.get("timestamp", ""),
+                    expert=expert,
+                    quote=quote,
+                    verified=verified,
+                )
+            )
+
+        results.append(
+            GroundedAnswer(
+                answer_text=item.get("answer", ""),
+                citations=citations,
+                not_mentioned=bool(
+                    item.get("not_mentioned", False)
+                ),
+            )
+        )
+
+    return results
+def cross_transcript_themes(
+    all_segments_by_expert: dict
+) -> dict:
     """
-    all_segments_by_expert: {expert_name: [QASegment, ...]}
-    Returns dict with 'themes' and 'disagreements', each a list of
-    {summary, citations:[{expert, quote, timestamp, source_file}]}.
+    Find common themes and disagreements across all experts.
     """
+
     parts = []
     flat_segments: List[QASegment] = []
+
     for expert, segs in all_segments_by_expert.items():
         parts.append(_format_segments(segs))
         flat_segments.extend(segs)
+
     excerpts_text = "\n".join(parts)
 
-    schema = (
-        '{"themes": [{"summary": string, "citations": [{"expert": string, '
-        '"quote": string, "timestamp": string, "source_file": string}]}], '
-        '"disagreements": [{"summary": string, "citations": [{"expert": string, '
-        '"quote": string, "timestamp": string, "source_file": string}]}]}'
-    )
-    prompt = (
-        f"EXCERPTS FROM ALL EXPERTS:\n{excerpts_text}\n\n"
-        "Identify:\n"
-        "1. COMMON THEMES that at least two experts independently raised.\n"
-        "2. DISAGREEMENTS where experts gave meaningfully different views "
-        "(e.g. different emphasis on finance vs training, different growth "
-        "estimates, different timelines).\n"
-        "Every theme/disagreement must cite at least one exact quote per expert involved.\n"
-        f"Return JSON matching this schema exactly: {schema}"
-    )
-    client = _client()
-    resp = client.messages.create(
-        model=MODEL_NAME,
-        max_tokens=2000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = "".join(block.text for block in resp.content if block.type == "text")
+    schema = """
+{
+  "themes": [
+    {
+      "summary": "string",
+      "citations": [
+        {
+          "expert": "string",
+          "quote": "exact quote",
+          "timestamp": "timestamp",
+          "source_file": "source file"
+        }
+      ]
+    }
+  ],
+  "disagreements": [
+    {
+      "summary": "string",
+      "citations": [
+        {
+          "expert": "string",
+          "quote": "exact quote",
+          "timestamp": "timestamp",
+          "source_file": "source file"
+        }
+      ]
+    }
+  ]
+}
+"""
+
+    prompt = f"""
+EXCERPTS FROM ALL EXPERTS:
+
+{excerpts_text}
+
+Identify:
+
+1. COMMON THEMES:
+Themes independently raised by at least two experts.
+
+2. DISAGREEMENTS:
+Meaningfully different views between experts, such as differences
+in emphasis, growth estimates, or adoption timelines.
+
+Every theme or disagreement must contain exact quotes from the
+experts involved.
+
+Do not invent quotes.
+
+Return JSON matching this schema exactly:
+
+{schema}
+"""
+
+    raw = _generate(prompt, max_tokens=2000)
     data = _extract_json(raw)
 
     def _verify_group(items):
         for item in items:
             for c in item.get("citations", []):
-                c["verified"] = verify_quote(c.get("quote", ""), flat_segments)
+                c["verified"] = verify_quote(
+                    c.get("quote", ""),
+                    flat_segments
+                )
+
         return items
 
-    data["themes"] = _verify_group(data.get("themes", []))
-    data["disagreements"] = _verify_group(data.get("disagreements", []))
+    data["themes"] = _verify_group(
+        data.get("themes", [])
+    )
+
+    data["disagreements"] = _verify_group(
+        data.get("disagreements", [])
+    )
+
     return data
 
 
-def ask_freeform_question(question: str, retrieved_segments: List[QASegment]) -> GroundedAnswer:
-    """Same grounding/citation contract as answer_question_for_expert, but the
-    caller passes in whatever the retriever found across ALL transcripts."""
-    return answer_question_for_expert(question, retrieved_segments)
+def ask_freeform_question(
+    question: str,
+    retrieved_segments: List[QASegment]
+) -> GroundedAnswer:
+    """
+    Answer a free-form question using retrieved segments
+    across all transcripts.
+    """
+
+    return answer_question_for_expert(
+        question,
+        retrieved_segments
+    )

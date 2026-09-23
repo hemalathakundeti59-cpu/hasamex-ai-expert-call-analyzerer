@@ -16,6 +16,7 @@ from interview_guide import load_questions
 from retrieval import TfidfIndex
 from llm_engine import (
     answer_question_for_expert,
+    answer_all_questions_for_expert,
     cross_transcript_themes,
     ask_freeform_question,
     Citation,
@@ -58,12 +59,10 @@ st.caption(
     "segment and quote-checked before display."
 )
 
-if not os.environ.get("ANTHROPIC_API_KEY"):
-    st.warning(
-        "No ANTHROPIC_API_KEY found. Copy `.env.example` to `.env`, add your key, "
-        "and restart the app."
+if not os.environ.get("GEMINI_API_KEY"):
+    st.error(
+        "No GEMINI_API_KEY found. Add your Gemini API key to `.env` and restart the app."
     )
-
 tab1, tab2, tab3, tab4 = st.tabs(
     ["📋 Per-Expert Answers", "🔍 Common Themes & Disagreements", "💬 Ask a Question", "📄 Raw Transcripts"]
 )
@@ -71,21 +70,49 @@ tab1, tab2, tab3, tab4 = st.tabs(
 # ---------------------------------------------------------------- Tab 1
 with tab1:
     st.subheader("Answer the interview guide, per expert")
-    selected_expert = st.selectbox("Choose an expert", experts)
-    if st.button("Generate answers for this expert", type="primary"):
-        expert_segments = index.all_for_expert(selected_expert)
-        with st.spinner("Answering from transcript..."):
-            for q in questions:
-                relevant = index.search(q, top_k=4, expert_filter=selected_expert)
-                result = answer_question_for_expert(q, relevant or expert_segments)
-                with st.expander(q, expanded=True):
-                    if result.not_mentioned:
-                        st.info("Not addressed in this transcript.")
-                    else:
-                        st.write(result.answer_text)
-                    for c in result.citations:
-                        render_citation(c)
 
+    selected_expert = st.selectbox("Choose an expert", experts)
+
+    if st.button("Generate answers for this expert", type="primary"):
+
+        expert_segments = index.all_for_expert(selected_expert)
+
+        with st.spinner("Answering all 6 questions from transcript..."):
+            try:
+                results = answer_all_questions_for_expert(
+                    questions,
+                    expert_segments
+                )
+
+                for q, result in zip(questions, results):
+
+                    with st.expander(q, expanded=True):
+
+                        if result.not_mentioned:
+                            st.info("Not addressed in this transcript.")
+                        else:
+                            st.write(result.answer_text)
+
+                        for c in result.citations:
+                            render_citation(c)
+
+            except Exception as e:
+
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    st.warning(
+                        "Gemini free-tier quota is currently exhausted. "
+                        "The optimized version now uses only one API call "
+                        "for all 6 questions."
+                    )
+
+                elif "503" in str(e) or "UNAVAILABLE" in str(e):
+                    st.warning(
+                        "Gemini is temporarily busy. "
+                        "Please try again later."
+                    )
+
+                else:
+                    st.error(f"Could not generate answers: {e}")
 # ---------------------------------------------------------------- Tab 2
 with tab2:
     st.subheader("Common themes and disagreements across all 3 experts")
