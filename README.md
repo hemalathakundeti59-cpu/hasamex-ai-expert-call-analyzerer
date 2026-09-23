@@ -11,7 +11,7 @@ across all transcripts.
 git clone <this-repo>
 cd hasamex-case-study
 pip install -r requirements.txt
-cp .env.example .env   # then paste your ANTHROPIC_API_KEY into .env
+cp .env.example .env   # then add your GEMINI_API_KEY to .env
 streamlit run app.py
 ```
 
@@ -57,17 +57,18 @@ data/*.txt  →  transcript_parser.py  →  QASegment[]  →  retrieval.py (TF-I
      Unverified quotes are flagged `⚠️` in the UI instead of trusted blindly.
 4. **`app.py`** — Streamlit UI that wires the three layers together and
    renders citations next to every claim.
-
 ## Model choice
 
-Claude (Sonnet) via the Anthropic Messages API, for two reasons specific to
-this task: strong instruction-following on "only answer from the provided
-text" style constraints, and reliable structured JSON output, which the
-whole citation/verification pipeline depends on. The model is swappable —
-`llm_engine.py` isolates all API calls behind three functions
-(`answer_question_for_expert`, `cross_transcript_themes`,
-`ask_freeform_question`), so pointing them at a different provider only
-touches one file.
+Gemini Flash via the Google GenAI API is used for the LLM layer. It provides fast
+instruction-following and structured JSON output, which fits the transcript
+grounding and citation-verification pipeline.
+
+The model is configurable through the `HASAMEX_MODEL` environment variable.
+The default model is `gemini-3.6-flash`.
+
+The LLM integration is isolated in `llm_engine.py`, so the provider can be
+changed without rewriting the Streamlit UI, transcript parser, or retrieval
+layer. 
 
 ## How citations/timestamps are handled
 
