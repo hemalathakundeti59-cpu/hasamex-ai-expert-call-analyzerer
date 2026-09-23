@@ -35,7 +35,7 @@ data/*.txt  →  transcript_parser.py  →  QASegment[]  →  retrieval.py (TF-I
                                                     top-k relevant segments
                                                               │
                                                         llm_engine.py
-                                                    (Claude, grounded prompt,
+                                                    (Gemini, grounded prompt,
                                                      JSON output, quote check)
                                                               │
                                                            app.py (Streamlit)
@@ -48,7 +48,7 @@ data/*.txt  →  transcript_parser.py  →  QASegment[]  →  retrieval.py (TF-I
    Given a question, returns the most relevant segments (optionally filtered
    to one expert). This keeps prompts focused instead of dumping every
    transcript into every call.
-3. **`llm_engine.py`** — the only place that talks to Claude. Every prompt:
+3. **`llm_engine.py`** —the only place that talks to Gemini. Every prompt:
    - Includes **only** the retrieved segments (never "answer from memory")
    - Forces **structured JSON output** (`answer`, `citations[]` with
      `quote`/`timestamp`/`source_file`)
@@ -119,10 +119,10 @@ The architecture is already split so this is a swap, not a rewrite:
 
 ```
 hasamex-case-study/
-├── app.py                  # Streamlit UI
-├── transcript_parser.py    # Deterministic .txt → structured segments
+├── app.py                   # Streamlit UI
+├── transcript_parser.py     # Deterministic .txt → structured segments
 ├── retrieval.py             # TF-IDF retriever
-├── llm_engine.py            # Claude calls + citation verification
+├── llm_engine.py            # Gemini calls + citation verification
 ├── interview_guide.py       # Parses the numbered questions
 ├── data/                    # Provided transcripts + interview guide
 ├── requirements.txt
